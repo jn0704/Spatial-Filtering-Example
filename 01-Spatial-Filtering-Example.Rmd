@@ -1,0 +1,223 @@
+---
+title: "Spatial Filtering Example"
+output: html_notebook
+---
+
+This notebook presents an example of spatial filtering.
+
+## Introduction
+
+## Preliminaries
+
+Load the packages used in this notebook
+```{r load-packages, message=FALSE}
+library(readxl)
+library(tidyverse)
+library(sf)
+library(spdep)
+library(adespatial)
+library(zeligverse)
+```
+
+Read the data files. This includes two Excel files retrieved from Toronto's [Open Data Portal](https://www.toronto.ca/city-government/data-research-maps/open-data/):
+
+- `WB-Civics.xlsx`
+- `WB-Economics.xlsx`
+
+In addition, there is one shapefile with the geography of Toronto's neighborhoods:
+
+- `NEIGHBOURHOODS_UTM6.shp`
+
+To read the Excel files, use the function `read_excel()` function:
+```{r}
+civics_toronto <- read_excel("WB-Civics.xlsx", sheet = "RawData-Ref Period 2011")
+economics_toronto <- read_excel("WB-Economics.xlsx", sheet = "RawData-Ref Period 2011")
+```
+
+Notice that the names of the columns are wrong (the first row in the original files was some sort of header for the spreadsheet). Replace with the first row of the spreadsheet that contains the actual names of the columns:
+```{r}
+colnames(civics_toronto) <- civics_toronto[1,]
+colnames(economics_toronto) <- economics_toronto[1,]
+```
+
+Next, remove the first row with the column names from the dataframe:
+```{r}
+civics_toronto <- civics_toronto[2:nrow(civics_toronto),]
+economics_toronto <- economics_toronto[2:nrow(economics_toronto),]
+```
+
+At the moment all variables are character type. Mutate the dataframes so that the variables are of the right type (i.e., numeric when appropriate):
+```{r}
+civics_toronto <- civics_toronto %>%
+  mutate(`Neighbourhood Id` = as.numeric(`Neighbourhood Id`),
+         `City Grants Funding $` = as.numeric(`City Grants Funding $`),
+         `Neighbourhood Equity Score` = as.numeric(`Neighbourhood Equity Score`),
+         `Salvation Army Donors` = as.numeric(`Salvation Army Donors`),
+         `Walk Score` = as.numeric(`Walk Score`),
+         `Watermain Breaks` = as.numeric(`Watermain Breaks`))
+
+economics_toronto <- economics_toronto %>%
+  mutate(`Neighbourhood Id` = as.numeric(`Neighbourhood Id`),
+         Businesses = as.numeric(Businesses),
+         `Child Care Spaces` = as.numeric(`Child Care Spaces`),
+         `Debt Risk Score` = as.numeric(`Debt Risk Score`),
+         `Home Prices` = as.numeric(`Home Prices`),
+         `Social Assistance Recipients` = as.numeric(`Social Assistance Recipients`))
+```
+
+Read the shapefile:
+```{r}
+neighborhoods_toronto.sf <- st_read("NEIGHBOURHOODS_UTM6.shp")
+```
+
+Notice that the value of reading the shapefile is an `sf` geographical object that is projected using UTM zone 17.
+
+Plot the neighborhoods:
+```{r}
+ggplot(data = neighborhoods_toronto.sf) +
+  geom_sf()
+```
+
+Mutate the variable `AREA_NAME` to match the names of the neighborhoods in the dataframes:
+```{r}
+neighborhoods_toronto.sf <- neighborhoods_toronto.sf %>%
+  mutate(AREA_CODE = as.numeric(AREA_CODE))
+```
+
+Join the data to the `sf` geographical object:
+```{r}
+neighborhoods_toronto.sf <- neighborhoods_toronto.sf %>%
+  left_join(civics_toronto, by = c("AREA_CODE" = "Neighbourhood Id")) %>%
+  left_join(economics_toronto, by = c("AREA_CODE" = "Neighbourhood Id"))
+```
+
+Rename variables:
+```{r}
+neighborhoods_toronto.sf <- neighborhoods_toronto.sf %>%
+  rename(SA_Donors = `Salvation Army Donors`,
+         Home_Prices = `Home Prices`,
+         Social_Assistance_Recipients = `Social Assistance Recipients`)
+```
+
+Linear regression model:
+```{r}
+mod0 <- lm(formula = SA_Donors ~ Home_Prices, data = neighborhoods_toronto.sf)
+summary(mod0)
+```
+
+Create a spatial weights matrix. For this we first obtain a list of neighbors:
+```{r}
+neighborhoods_toronto.nb <- poly2nb(as(neighborhoods_toronto.sf, "Spatial"))
+```
+
+Which are then converted to list of spatial weights:
+```{r}
+neighborhoods_toronto.lw <- nb2listw(neighborhoods_toronto.nb)
+```
+
+The list of spatial weights can then be used to obtain the Moran's Eigenvector Maps:
+```{r}
+neighborhoods_toronto.mem <- mem(neighborhoods_toronto.lw)
+neighborhoods_toronto.mem$AREA_CODE <- neighborhoods_toronto.sf$AREA_CODE
+```
+
+Bind the eigenvectors to the `sf` dataframe:
+```{r}
+neighborhoods_toronto.sf <- neighborhoods_toronto.sf %>%
+  left_join(neighborhoods_toronto.mem, by = "AREA_CODE")
+```
+
+Check the map patterns:
+```{r}
+ggplot(data = neighborhoods_toronto.sf) + 
+  geom_sf(aes(fill = MEM4))
+```
+
+We will repeat the base model but using `zelig`:
+```{r model0, echo=FALSE}
+#Estimate negative binomial model
+mod0 <- zelig(SA_Donors ~ Home_Prices, 
+              data = neighborhoods_toronto.sf,
+              model = "ls",
+              cite = FALSE)
+summary(mod0)
+```
+
+Now, test for spatial autocorrelation using Moran's I:
+```{r}
+zi.0 <- moran.test(unlist(residuals(mod0)), neighborhoods_toronto.lw)
+zi.0
+```
+
+There is sigificant spatial autocorrelation with a p-value of less than 0.0001. Check the spatial distribution of residuals of the model:
+```{r}
+ggplot(data=neighborhoods_toronto.sf) + geom_sf(aes(fill = unlist(residuals(mod0))))
+```
+
+This model is a candidate for spatial filtering.
+
+First, obtain a dataframe with the variables for the regression analysis with the filters:
+```{r}
+df0 <- neighborhoods_toronto.sf %>%
+  dplyr::select(SA_Donors, Home_Prices) %>%
+  st_drop_geometry()
+
+Toronto.mem <- neighborhoods_toronto.mem %>%
+  dplyr::select(-AREA_CODE)
+```
+
+To implement this we adopt two criteria:
+
+1. A candidate for the filter is an eigevenctor map that is a significant covariate in the model
+2. That the eigenvector map reduced autocorrelation
+
+```{r model1, echo=FALSE, include=FALSE}
+#Fit a spatial filter to this model based on Moran's eigenvalues:
+
+#Initialize a spatial filter:
+SF <- numeric(length = nrow(df0))
+
+#Initialize tolerance, counter, and index:
+tol <- 1;
+count <- 0;
+SF_INDEX <- 0
+
+K <- ncol(df0) - 1
+
+#Obtain filter
+while(tol >= 0.5){
+  count <- count + 1
+  junkSF <- data.frame(SF = SF, V = Toronto.mem[,count])
+  #remove columns with all zeros
+  junkSF <- Filter(function(x)!all(x == 0), junkSF)
+  #estimate model
+  junkmod <- zelig(SA_Donors ~ ., 
+                   model = "ls", 
+                   data = cbind(df0, junkSF), 
+                   cite = FALSE)
+  pvals <- get_pvalue(junkmod)
+  junkb <- coef(junkmod)
+  if(pvals[[1]]["V"] <= 0.10){
+    SF_INDEX[count] <- count
+    SF <- as.matrix(junkSF) %*% junkb[(K+2):length(junkb)]
+    junkmod <- zelig(SA_Donors ~ ., 
+                     model = "ls", 
+                     data = cbind(df0, SF), 
+                     cite = FALSE)
+    junke <- unlist(residuals(junkmod))
+    ei <- moran.test(junke, neighborhoods_toronto.lw)
+    tol <- ei$statistic
+    tol <- unname(tol)
+  }
+}
+
+# Final model with spatial filter
+SF_INDEX <- SF_INDEX[!is.na(SF_INDEX)]
+Filter1 <- SF
+mod1 <- zelig(SA_Donors ~ ., 
+              model = "ls", 
+              data = cbind(df0, Filter1), 
+              cite = FALSE)
+summary(mod1)
+```
+
